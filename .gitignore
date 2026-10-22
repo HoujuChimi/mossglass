@@ -1,0 +1,16 @@
+# Build intermediates and outputs
+app.res
+*.o
+*.obj
+*.exe
+*.dll
+*.pdb
+*.ilk
+
+# Runtime files written by the app (per-user state, never part of the source)
+ecobottle.cfg
+ecobottle.state
+
+# Windows shell artifacts
+Thumbs.db
+Desktop.ini

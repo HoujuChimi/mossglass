@@ -1,0 +1,13 @@
+# Keep the source portable across Windows and other toolchains.
+* text=auto
+*.cpp text eol=lf
+*.h text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.rc text eol=crlf
+*.bat text eol=crlf
+*.ico binary
+*.png binary
+*.gif binary
+*.exe binary
+*.dll binary

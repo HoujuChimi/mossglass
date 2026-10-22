@@ -49,7 +49,6 @@
 | [`app.rc`](app.rc) | Windows 资源脚本，把程序图标编进 exe |
 | [`icon.ico`](icon.ico) | 程序图标，16 / 24 / 32 / 48 / 64 / 128 / 256 多尺寸内嵌 |
 | [`build_mingw.bat`](build_mingw.bat) | MinGW-w64 一键编译脚本 |
-| [`.github/workflows/release.yml`](.github/workflows/release.yml) | CI：MSYS2 构建 → SignPath 代码签名 → 打包并发布 Release |
 | [`LICENSE`](LICENSE) | 本项目源码的 MIT 许可证 |
 | [`LICENSE-SDL2.txt`](LICENSE-SDL2.txt) / [`LICENSE-winpthreads.txt`](LICENSE-winpthreads.txt) | 随附运行库的原始许可证 |
 | [`preview.png`](preview.png) | 4× 最近邻放大静态预览 |
@@ -656,47 +655,6 @@ event_weight_food=100
 - 灌木核对：默认六丛（x=36 / 86 / 134 / 182 / 232 / 284），高度 3–5px（天空带 9–17px 的四分之一到三分之一）；存活低于 5 丛时每 6 秒补种，冬季叶冠归零但根系保留，春季回升；关闭再启动后位置与年龄延续。
 - 抖动与卡住修复核对：连续采样相隔 4 秒的画面，鳑鲏由右侧 x≈205 移动到 x≈257、左侧个体移动约 35px，未再出现贴墙原地翻转或长时间悬停在水面；领地内的个体只在 ±7px 范围内巡逻，属于预期行为。
 - 面板自动收起实测：右键开面板后，左键点击桌面空白处（面板外、瓶子外）面板立即隐藏；穿透模式下开面板会临时移除 `WS_EX_TRANSPARENT`，关闭后自动恢复，`click_through=1` 在交互与重启后均保持不变。
-
-## 发布与代码签名
-
-正式发布包不由本机打包，而是由 GitHub Actions 构建：MSYS2 的 MinGW-w64 工具链编译，再通过 **SignPath Foundation**（面向开源项目的免费 Windows 代码签名服务，签发 OV 级证书）签名，最后压缩并附上 `SHA256SUMS.txt`。
-
-推送 `v*` 标签会触发 `.github/workflows/release.yml`：
-
-1. 在 `windows-latest` 上用 MSYS2 安装 `mingw-w64-x86_64-gcc` 与 `mingw-w64-x86_64-SDL2`，按 `build_mingw.bat` 的参数编译
-2. 把 `EcoBottle.exe` 上传为 workflow artifact（SignPath 只签经 GitHub 上传的产物）
-3. 提交签名请求，等待完成并下载回已签名的 exe
-4. 用 `Get-AuthenticodeSignature` 校验，状态不是 `Valid` 就让整个构建失败
-5. 打包 `Mossglass-<tag>-win64.zip`、生成 SHA-256 校验文件并创建 GitHub Release
-
-维护者只需接入一次：
-
-- 用开启 MFA 的 GitHub 账号注册 SignPath，向 [SignPath Foundation](https://signpath.org/) 提交项目申请（要求 OSI 认可许可证、公开仓库、已有发布、功能有文档、无恶意代码）
-- 通过后在 SignPath 创建 Organization、Project 与 `release-signing` 签名策略，并新建 Artifact Configuration：
-
-```xml
-<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
-  <zip-file>
-    <pe-file path="EcoBottle.exe">
-      <authenticode-sign/>
-    </pe-file>
-  </zip-file>
-</artifact-configuration>
-```
-
-- 安装 [SignPath GitHub App](https://github.com/apps/signpath) 并授权本仓库
-- 在仓库添加 Secrets `SIGNPATH_API_TOKEN`、`SIGNPATH_ORGANIZATION_ID`，以及 Variables `SIGNPATH_PROJECT_SLUG`、`SIGNPATH_SIGNING_POLICY_SLUG`
-
-未配置这些值时 workflow 照常构建，只是产出未签名包（`SIGNPATH_API_TOKEN` 为空会跳过签名与校验步骤）。
-
-校验下载到的成品：
-
-```powershell
-Get-AuthenticodeSignature .\EcoBottle.exe | Format-List Status, SignerCertificate
-Get-FileHash .\Mossglass-v1.0.0-win64.zip -Algorithm SHA256
-```
-
-签名后的 exe 会显示 SignPath Foundation 作为发布者，SmartScreen 的拦截频率随下载量累积而下降。
 
 ## 许可
 

@@ -6,6 +6,15 @@ app.res
 *.dll
 *.pdb
 *.ilk
+dist/
+signed/
+Mossglass-*.zip
+SHA256SUMS.txt
+
+# Signing keys must never enter the repository
+*.pfx
+*.pvk
+*.snk
 
 # Runtime files written by the app (per-user state, never part of the source)
 ecobottle.cfg

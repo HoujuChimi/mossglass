@@ -2485,6 +2485,15 @@ private:
     static int stageFromGrowth(float growth) {
         return (growth < 0.35f) ? 0 : (growth < 0.70f ? 1 : 2);
     }
+    // Ontogenetic maturation: an animal also grows with age between meals.
+    // Nutrition and health set the pace, so a starving individual stalls.
+    // Growth used to come only from captures, which left damselfly nymphs and
+    // bitterling juvenile for their entire life even in a well-fed bottle.
+    static float maturationStep(float energy, float health, float rate, float dt) {
+        const float nutrition = std::clamp(energy / 62.0f, 0.10f, 1.0f)
+                              * (0.35f + 0.65f * std::clamp(health, 0.0f, 1.0f));
+        return dt * rate * nutrition;
+    }
     static float motionScale(float growth) {
         return 0.58f + 0.42f * std::clamp(growth, 0.0f, 1.0f);
     }
@@ -3104,6 +3113,8 @@ private:
         for (int i = shrimpCount_ - 1; i >= 0; --i) {
             Shrimp& s = shrimp_[i];
             s.age += dt;
+            s.growth = std::min(1.0f, s.growth + maturationStep(
+                s.energy, s.health, 0.0050f, dt));
             s.stage = stageFromGrowth(s.growth);
             const float speedStage = motionScale(s.growth);
             s.energy = std::max(0.0f, s.energy - dt * 0.14f
@@ -3426,6 +3437,8 @@ private:
         for (int i = damselCount_ - 1; i >= 0; --i) {
             Damsel& d = damsel_[i];
             d.age += dt;
+            d.growth = std::min(1.0f, d.growth + maturationStep(
+                d.energy, d.health, 0.0048f, dt));
             d.stage = stageFromGrowth(d.growth);
             const float size = stageScale(d.stage) * d.g.size;
             d.energy = std::max(0.0f, d.energy - dt
@@ -3507,10 +3520,14 @@ private:
                 const float tx = (d.startleTimer > 0.0f)
                                ? std::clamp(d.x + (d.x - d.startleX) * 1.6f, 11.0f, 293.0f)
                                : std::clamp(nearestPlantX(d.x, true), 11.0f, 293.0f);
+                // A clinging nymph keeps shifting its grip along the stem
+                // instead of freezing in place, so it still reads as alive.
+                const float clingY = 62.0f
+                    + std::sin(simTime_ * 0.30f + static_cast<float>(i) * 1.9f) * 6.0f;
                 const float ty = (d.startleTimer > 0.0f)
                                ? std::clamp(d.y + (d.y - d.startleY) * 1.4f,
                                             damselGoalMinY, damselGoalMaxY)
-                               : 62.0f;
+                               : std::clamp(clingY, damselGoalMinY, damselGoalMaxY);
                 const float dx = tx - d.x;
                 const float dy = ty - d.y;
                 const float dist = std::sqrt(dx * dx + dy * dy);
@@ -3567,18 +3584,26 @@ private:
                 if (scent.preyScent > 0.12f) {
                     float bestScent = scent.preyScent;
                     float bx = d.x, by = d.y;
+                    bool found = false;
                     const float ox[4] = {-20, 20, 0, 0};
                     const float oy[4] = {0, 0, -13, 13};
                     for (int k = 0; k < 4; ++k) {
                         const auto& c = cellAt(d.x + ox[k], d.y + oy[k]);
-                        if (c.preyScent > bestScent) {
+                        // A nymph deposits prey scent under itself, so its own
+                        // cell is often the local maximum.  Following that cell
+                        // would pin it in place for good; only a clearly
+                        // stronger neighbouring cell is worth walking to.
+                        if (c.preyScent > bestScent + 0.02f) {
                             bestScent = c.preyScent;
                             bx = d.x + ox[k];
                             by = d.y + oy[k];
+                            found = true;
                         }
                     }
-                    d.targetX = std::clamp(bx, 11.0f, 293.0f);
-                    d.targetY = std::clamp(by, damselGoalMinY, damselGoalMaxY);
+                    if (found) {
+                        d.targetX = std::clamp(bx, 11.0f, 293.0f);
+                        d.targetY = std::clamp(by, damselGoalMinY, damselGoalMaxY);
+                    }
                 }
                 d.targetX = std::clamp(d.targetX, 11.0f, 293.0f);
                 d.targetY = std::clamp(d.targetY, damselGoalMinY, damselGoalMaxY);
@@ -3682,6 +3707,8 @@ private:
         for (int i = fishCount_ - 1; i >= 0; --i) {
             Fish& f = fish_[i];
             f.age += dt;
+            f.growth = std::min(1.0f, f.growth + maturationStep(
+                f.energy, f.health, 0.0042f, dt));
             f.stage = stageFromGrowth(f.growth);
             const float fishSize = stageScale(f.stage) * f.g.size;
             const bool lowPrey = shrimpCount_ <= 3 && damselCount_ <= 1;
@@ -3897,11 +3924,16 @@ private:
                     f.targetY = std::clamp(f.y + (f.y - f.startleY) * 1.3f,
                                            fishGoalMinY, fishGoalMaxY);
                 } else if (resting_ && f.energy > 55.0f) {
+                    // A fed fish settles by the nearest plant.  Each one gets
+                    // its own height lane, otherwise two fish park on the same
+                    // stem at one level and hold a nose-to-nose "kiss".
+                    const float lane = (i & 1) ? 7.0f : -7.0f;
                     f.targetX = std::clamp(nearestPlantX(f.x, true), kFishMinX, kFishMaxX);
-                    f.targetY = 55.0f;
+                    f.targetY = std::clamp(55.0f + lane, fishGoalMinY, fishGoalMaxY);
                 } else if (brightHide) {
+                    const float lane = (i & 1) ? 7.0f : -7.0f;
                     f.targetX = std::clamp(shadeX, kFishMinX, kFishMaxX);
-                    f.targetY = 58.0f;
+                    f.targetY = std::clamp(58.0f + lane, fishGoalMinY, fishGoalMaxY);
                 } else if (f.energy < 58.0f
                            && (browseRaft = nearestRaft(f.x, 44.0f)) >= 0) {
                     // A hungry, omnivorous fish rises to lip duckweed off the
@@ -4054,7 +4086,9 @@ private:
         }
 
         // Soft body separation: two adult bitterlings can share a territory
-        // edge, but never occupy the same point or visibly overlap.
+        // edge, but never occupy the same point or visibly overlap.  The
+        // clearance follows the drawn width (16 px sprite * speciesBase 2.0),
+        // so two adults no longer sit with their heads merged into a "kiss".
         for (int a = 0; a < fishCount_; ++a) {
             for (int b = a + 1; b < fishCount_; ++b) {
                 Fish& fa = fish_[a];
@@ -4062,13 +4096,21 @@ private:
                 float dx = fb.x - fa.x;
                 float dy = fb.y - fa.y;
                 float dist = std::sqrt(dx * dx + dy * dy);
-                const float minD = 18.0f + 3.0f * visualScale(fa.growth)
-                                 + 3.0f * visualScale(fb.growth);
+                const float halfA = 8.0f * speciesBase(1) * visualScale(fa.growth) * fa.g.size;
+                const float halfB = 8.0f * speciesBase(1) * visualScale(fb.growth) * fb.g.size;
+                const float minD = halfA + halfB + 2.0f;
                 if (dist >= minD) continue;
                 if (dist < 0.01f) {
                     dx = (a & 1) ? 1.0f : -1.0f;
                     dy = 0.3f;
                     dist = 1.0f;
+                }
+                // A pair holding the same plant or raft at one height sits
+                // dead level and reads as mouth to mouth.  A small fixed
+                // stagger keeps them beside each other instead.
+                if (std::fabs(dy) < 3.0f) {
+                    dy = (a & 1) ? 3.0f : -3.0f;
+                    dist = std::sqrt(dx * dx + dy * dy);
                 }
                 const float push = (minD - dist) * 0.5f;
                 const float nx = dx / dist;
@@ -4092,6 +4134,8 @@ private:
         for (int i = wormCount_ - 1; i >= 0; --i) {
             Worm& w = worms_[i];
             w.age += dt;
+            w.growth = std::min(1.0f, w.growth + maturationStep(
+                w.energy, w.health, 0.0030f, dt));
             w.stage = stageFromGrowth(w.growth);
             w.breedCooldown -= dt;
             w.dirTimer -= dt;
@@ -4153,8 +4197,9 @@ private:
             t.health -= dt * (0.0020f + 0.020f * lowO2
                               + tubifexStress * 0.0045f)
                       / std::max(0.6f, t.g.oxygen);
-            t.growth = std::min(1.0f, t.growth + dt * 0.006f * localFood);
-            t.stage = 0;
+            t.growth = std::min(1.0f, t.growth + dt * 0.006f * localFood
+                                 + maturationStep(t.energy, t.health, 0.0040f, dt));
+            t.stage = stageFromGrowth(t.growth);
 
             // They graze the very top of the mud, not the water column.
             addSediment(t.x, -dt * 0.026f * localFood);
@@ -4660,7 +4705,7 @@ private:
 
     void updateEggs(float dt) {
         updateAttachedEggs(dt);
-        if (fishEggs_ > 0 && fishCount_ <= 2 && oxygen_ > 42.0f
+        if (fishEggs_ > 0 && fishCount_ < g_settings.maxFish && oxygen_ > 42.0f
             && shrimpCount_ >= 2 && plantCount_ >= 3) {
             fishEggTimer_ += dt;
             if (fishEggTimer_ >= 28.0f) {
@@ -4673,7 +4718,7 @@ private:
             fishEggTimer_ = 0.0f;
         }
 
-        if (damselEggs_ > 0 && damselCount_ <= 2 && oxygen_ > 44.0f
+        if (damselEggs_ > 0 && damselCount_ < g_settings.maxDamsel && oxygen_ > 44.0f
             && shrimpCount_ >= 2 && plantCount_ >= 3) {
             damselEggTimer_ += dt;
             if (damselEggTimer_ >= 30.0f) {
@@ -4686,7 +4731,7 @@ private:
             damselEggTimer_ = 0.0f;
         }
 
-        if (shrimpEggs_ > 0 && shrimpCount_ <= 3 && oxygen_ > 44.0f
+        if (shrimpEggs_ > 0 && shrimpCount_ < g_settings.maxShrimp && oxygen_ > 44.0f
             && plantCount_ >= 2) {
             shrimpEggTimer_ += dt;
             if (shrimpEggTimer_ >= 20.0f) {
@@ -5048,7 +5093,7 @@ private:
         t.health = 1.0f;
         t.age = rnd(0.0f, 65.0f);
         t.growth = rnd(0.42f, 0.68f);
-        t.stage = 0;
+        t.stage = stageFromGrowth(t.growth);
         t.breedCooldown = rnd(40.0f, 70.0f);
         t.g = g;
         t.id = nextId_++;
@@ -7273,6 +7318,19 @@ private:
         SDL_SetRenderDrawBlendMode(r_, SDL_BLENDMODE_NONE);
     }
 
+    // Sprite mirroring follows a clear horizontal heading only.  A shrimp
+    // hovering on its goal has vx oscillating around zero, and testing vx<0
+    // every frame mirrored the sprite back and forth, which read as whipping
+    // its head left and right.  Near standstill the previous heading is kept.
+    bool facesLeft(uint32_t id, float vx) {
+        const auto it = facing_.find(id);
+        int dir = (it == facing_.end()) ? (vx < 0.0f ? -1 : 1) : it->second;
+        if (vx < -0.9f) dir = -1;
+        else if (vx > 0.9f) dir = 1;
+        facing_[id] = dir;
+        return dir < 0;
+    }
+
     void drawShrimp(const Ecosystem& eco) {
         const auto* shrimp = eco.shrimp();
         for (int i = 0; i < eco.shrimpCount(); ++i) {
@@ -7303,7 +7361,7 @@ private:
                 tintAmount = std::max(tintAmount, 0.45f * weak);
             }
             art::drawSpriteScaled(r_, &art::kShrimpFrames[frame][0][0], 16, 16, 17,
-                                  x, y, scale, scale, s.vx < 0.0f, false, 0.0f,
+                                  x, y, scale, scale, facesLeft(s.id, s.vx), false, 0.0f,
                                   tint, tintAmount, 255);
         }
     }
@@ -7337,7 +7395,7 @@ private:
                 tintAmount = std::max(tintAmount, 0.45f * weak);
             }
             art::drawSpriteScaled(r_, &art::kDamselFrames[frame][0][0], 16, 16, 17,
-                                  x, y, scale, scale, d.vx < 0.0f, false, 0.0f,
+                                  x, y, scale, scale, facesLeft(d.id, d.vx), false, 0.0f,
                                   tint, tintAmount, 255);
         }
     }
@@ -7372,7 +7430,7 @@ private:
             }
 
             art::drawSpriteScaled(r_, &art::kFishFrames[frame][0][0], 16, 16, 17,
-                                  x, y, scale, scale, f.vx < 0.0f, false, 0.0f,
+                                  x, y, scale, scale, facesLeft(f.id, f.vx), false, 0.0f,
                                   tint, tintAmount, 255);
         }
     }
@@ -7542,6 +7600,9 @@ private:
 
     SDL_Renderer* r_ = nullptr;
     SDL_Texture* bg_ = nullptr;
+    // Last rendered heading per individual, so mirroring only changes on a
+    // real direction change rather than on sub-pixel velocity noise.
+    std::unordered_map<uint32_t, int> facing_;
     SDL_Texture* scene_ = nullptr;
     std::vector<Uint32> bgPixels_;
     std::vector<Uint32> plantPixels_;

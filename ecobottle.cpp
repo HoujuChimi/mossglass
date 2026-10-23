@@ -9286,7 +9286,19 @@ private:
         s.bank = eco.fishEggs() + eco.damselEggs() + eco.shrimpEggs()
                + eco.tubifexEggs() + eco.wormCysts() + eco.plantSeeds();
         s.territory = eco.territoryCount();
-        s.biomass = eco.plantBiomass();
+        // Panel-only biomass.  Ecosystem::plantBiomass_ is clamped at 8.0
+        // because it also scales respiration and nutrient uptake, so once the
+        // stand is lush that value stops moving and the LIFE row would lie.
+        // Recompute the same weighted mass here without the cap; the row is
+        // normalised against the configured plant capacity in drawLife().
+        float biomassRaw = 0.0f;
+        for (int i = 0; i < s.plants; ++i) {
+            const auto& p = eco.plants()[i];
+            const float typeW = (p.type == 1 ? 1.25f : (p.type == 2 ? 0.95f : 0.70f));
+            biomassRaw += typeW * p.growth * p.health * p.g.density
+                        * (p.dying ? 0.20f : 1.0f);
+        }
+        s.biomass = biomassRaw;
         s.season = static_cast<int>(eco.seasonPhase() / 6.2831853f * 4.0f) & 3;
         s.day = static_cast<int>(eco.dayPhase() / 6.2831853f * 4.0f) & 3;
 
@@ -9700,13 +9712,21 @@ private:
         int y = kRowsY;
         const int x = kRightX;
         const int w = kColW;
+        // Dormant bank ceiling: four 6-slot animal egg banks + 4 worm cysts
+        // + 5 loose plant seeds + three types x 3 typed seeds.
+        constexpr float kBankFull = 4.0f * 6.0f + 4.0f + 5.0f + 3.0f * 3.0f;
 
         drawRow(x, y, w, kIcoPlant, kMoss, kIce,
                 L"水草", ratio(s.plants, g_settings.maxPlants),
                 static_cast<float>(s.plants) / g_settings.maxPlants, true,
                 s.plants > 0 ? kMoss : kRust); y += kRowH;
+        // Full scale is every allowed plant at the tallest form's oxygen
+        // weight (1.25) and the top density gene (1.1), i.e. 1.375 each, so
+        // the bar tracks the stand instead of pinning at a fixed 8.0.
+        const float biomassFull = std::max(1, g_settings.maxPlants) * 1.375f;
         drawRow(x, y, w, kIcoPlant, kMossDark, kMoss,
-                L"生物量", fmt(s.biomass, L"%.1f"), s.biomass / 8.0f, true, kMoss); y += kRowH;
+                L"生物量", fmt(s.biomass, L"%.1f"), s.biomass / biomassFull, true,
+                kMoss); y += kRowH;
         drawRow(x, y, w, kIcoShrimp, kAmber, kCream,
                 L"米虾", ratio(s.shrimp, g_settings.maxShrimp),
                 static_cast<float>(s.shrimp) / g_settings.maxShrimp, true,
@@ -9739,7 +9759,7 @@ private:
                 static_cast<float>(s.eggs) / 12.0f, false, kCream); y += kRowH;
         drawRow(x, y, w, kIcoEgg, kFaint, kMoss,
                 L"休眠库", std::to_wstring(s.bank),
-                static_cast<float>(s.bank) / 24.0f, false, kDim); y += kRowH;
+                static_cast<float>(s.bank) / kBankFull, false, kDim); y += kRowH;
         drawRow(x, y, w, kIcoCorpse, kFaint, kRust,
                 L"尸体", std::to_wstring(s.corpses),
                 static_cast<float>(s.corpses) / 10.0f, false, kDim);

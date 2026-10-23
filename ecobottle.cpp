@@ -1578,16 +1578,39 @@ public:
         if (debugTimer_ >= 10.0f) {
             debugTimer_ = 0.0f;
             float hpMin = 1.0f, hpSum = 0.0f;
+            float enMin = 100.0f;
+            float hpKind[3] = {1.0f, 1.0f, 1.0f};
+            float enKind[3] = {100.0f, 100.0f, 100.0f};
             int hpN = 0;
+            int damselPhase[3] = {0, 0, 0};
+            float damselPhaseEn[3] = {100.0f, 100.0f, 100.0f};
             auto sampleHp = [&](float v) { hpMin = std::min(hpMin, v); hpSum += v; ++hpN; };
-            for (int i = 0; i < shrimpCount_; ++i) sampleHp(shrimp_[i].health);
-            for (int i = 0; i < damselCount_; ++i) sampleHp(damsel_[i].health);
-            for (int i = 0; i < fishCount_; ++i) sampleHp(fish_[i].health);
+            for (int i = 0; i < shrimpCount_; ++i) {
+                sampleHp(shrimp_[i].health);
+                hpKind[0] = std::min(hpKind[0], shrimp_[i].health);
+                enKind[0] = std::min(enKind[0], shrimp_[i].energy);
+            }
+            for (int i = 0; i < damselCount_; ++i) {
+                sampleHp(damsel_[i].health);
+                hpKind[1] = std::min(hpKind[1], damsel_[i].health);
+                enKind[1] = std::min(enKind[1], damsel_[i].energy);
+                ++damselPhase[damsel_[i].stage];
+                damselPhaseEn[damsel_[i].stage] =
+                    std::min(damselPhaseEn[damsel_[i].stage], damsel_[i].energy);
+            }
+            for (int i = 0; i < fishCount_; ++i) {
+                sampleHp(fish_[i].health);
+                hpKind[2] = std::min(hpKind[2], fish_[i].health);
+                enKind[2] = std::min(enKind[2], fish_[i].energy);
+            }
+            for (int i = 0; i < 3; ++i) enMin = std::min(enMin, enKind[i]);
             std::fprintf(stderr,
                 "[sim] t=%5.0f light=%5.1f O2=%5.1f humus=%5.1f nut=%5.1f "
                 "night=%4.2f plants=%d shrimp=%d damsel=%d fish=%d worms=%d "
                 "tubifex=%d corpses=%d eggs=%d/%d/%d lay=%d temp=%4.1f day=%4.2f sed=%4.1f terr=%d "
-                "ev=%d:%d:%d hp=%4.2f/%4.2f\n",
+                "ev=%d:%d:%d hp=%4.2f/%4.2f en=%5.1f "
+                "hpk=%4.2f/%4.2f/%4.2f enk=%5.1f/%5.1f/%5.1f "
+                "dstg=%d/%d/%d den=%4.1f/%4.1f/%4.1f\n",
                 static_cast<double>(simTime_), static_cast<double>(light_),
                 static_cast<double>(oxygen_), static_cast<double>(humus_),
                 static_cast<double>(nutrient_), static_cast<double>(night_),
@@ -1600,7 +1623,15 @@ public:
                 eventCount_ > 1 ? events_[1].type : -1,
                 eventCount_ > 2 ? events_[2].type : -1,
                 static_cast<double>(hpMin),
-                static_cast<double>(hpN > 0 ? hpSum / static_cast<float>(hpN) : 1.0f));
+                static_cast<double>(hpN > 0 ? hpSum / static_cast<float>(hpN) : 1.0f),
+                static_cast<double>(enMin),
+                static_cast<double>(hpKind[0]), static_cast<double>(hpKind[1]),
+                static_cast<double>(hpKind[2]), static_cast<double>(enKind[0]),
+                static_cast<double>(enKind[1]), static_cast<double>(enKind[2]),
+                damselPhase[0], damselPhase[1], damselPhase[2],
+                static_cast<double>(damselPhaseEn[0]),
+                static_cast<double>(damselPhaseEn[1]),
+                static_cast<double>(damselPhaseEn[2]));
         }
 #endif
     }
@@ -1988,6 +2019,15 @@ public:
         eventBloom_ = std::clamp(bloomIntensity, 0.0f, 1.4f);
         eventWater_ = std::clamp(eventWater_, -12.0f, 12.0f);
         eventTemp_ = std::clamp(eventTemp_, -4.5f, 4.5f);
+        // Overlapping weather cannot drain the same oxygen pool at full rate.
+        // Aerobic decay in the mud and the water column stalls once the bottle
+        // is lean, so demand fades out with the remaining oxygen instead of
+        // pulling the last of it to zero.  This is what keeps a heatwave on
+        // top of a drought and an overturn from sterilising the bottle.
+        if (eventO2Rate_ < 0.0f) {
+            const float scarcity = std::clamp((oxygen_ - 12.0f) / 48.0f, 0.0f, 1.0f);
+            eventO2Rate_ *= 0.18f + 0.82f * scarcity * scarcity;
+        }
     }
 
     // Holling functional responses.  Type II saturates smoothly, type III is
@@ -2521,6 +2561,20 @@ private:
         const float spread = 0.86f + 0.28f
             * static_cast<float>(art::hash2(static_cast<int>(id), 17) % 1000u) / 1000.0f;
         return base * spread;
+    }
+    // Density-dependent mortality: the fewer members of a species are left,
+    // the more room, food and clean water each survivor has, so environmental
+    // stress costs them less.  This is the demographic brake that makes a
+    // total wipe practically impossible without ever conjuring an animal:
+    // the rarer a lineage becomes, the harder it is to kill the last few.
+    static float rareSpeciesRelief(int count, int cap) {
+        if (cap <= 0) return 1.0f;
+        const float frac = static_cast<float>(count) / static_cast<float>(cap);
+        // A sparse lineage is released from crowding stress long before it is
+        // common: at a tenth of capacity a survivor takes roughly a third of
+        // the damage a crowded individual would, which is what stops a bad
+        // night from taking the last few animals with it.
+        return std::clamp(0.32f + 0.68f * frac / 0.50f, 0.32f, 1.0f);
     }
     static float plantTypeO2(int type) {
         return (type == 1 ? 1.25f : (type == 2 ? 0.95f : 0.70f));
@@ -3420,24 +3474,26 @@ private:
                 }
             }
 
+            const float relief = rareSpeciesRelief(shrimpCount_, g_settings.maxShrimp);
             const float localStress = localStressAt(s.x, s.y, 0, s.g);
-            s.health -= dt * localStress * 0.0035f;
+            s.health -= dt * stressDamage(localStress) * 0.0110f * relief;
             s.energy = std::max(0.0f, s.energy - dt * localStress * 0.055f);
             const float hypoxia = std::clamp((22.0f - oxygen_) / 22.0f, 0.0f, 1.0f);
             const float tolerance = s.g.oxygen * (0.92f + 0.08f * s.g.size) * toleranceScale(s.growth);
-            if (hypoxia > 0.0f) s.health -= dt * hypoxia * 0.0040f / tolerance;
+            if (hypoxia > 0.0f) s.health -= dt * hypoxia * 0.0040f / tolerance * relief;
             if (s.energy <= 0.0f) s.health -= dt * 0.0090f;
             const float lifespan = 300.0f * lifespanScale(s.g, s.id);
             if (s.age > lifespan) {
                 s.health -= dt * 0.0012f;
-            } else if (s.health < 1.0f && s.energy > 42.0f && localStress < 0.22f) {
+            } else if (s.health < 1.0f && s.energy > 35.0f && localStress < 0.70f) {
                 // Healing is what makes the cycle robust.  When health could
                 // only ever fall, a run of poor nights dragged every shrimp,
                 // nymph and fish down at the same rate, so all three lineages
                 // died within minutes of each other and the bottle went empty.
-                // A body that has not reached its own lifespan mends in benign
-                // water, so a bad spell is survived instead of accumulating.
-                s.health = std::min(1.0f, s.health + dt * 0.0016f);
+                // It works best in clean water and merely ticks over in water
+                // that is only tolerable, so a bad spell is survived.
+                const float calm = 1.0f - localStress / 0.70f;
+                s.health = std::min(1.0f, s.health + dt * (0.0008f + 0.0022f * calm));
             }
 
             if (s.health <= 0.0f) {
@@ -3545,19 +3601,60 @@ private:
 
             int target = -1;
             const int adultShrimp = adultShrimpCount();
-            if ((!resting_ || d.energy < 70.0f) && !nearFish && light_ < 60.0f
-                && shrimpCount_ > 3 && d.energy < 92.0f) {
-                target = nearestShrimpIndex(d.x, d.y, 76.0f);
-                if (target >= 0) {
-                    const float preySize = stageScale(shrimp_[target].stage)
-                                         * shrimp_[target].g.size;
-                    if (preySize < 0.80f * size) target = -1;
-                    if (target >= 0 && adultShrimp <= 1
-                        && shrimp_[target].stage == 2) target = -1;
+            // A nymph can handle prey close to its own body, and a hungry one
+            // will tackle food it would ignore when full.  The old rule
+            // compared bare stage scales, so every nymph could only ever take
+            // a shrimp hatchling; once the shrimp bank matured, whole broods
+            // sat next to food they were forbidden to touch.
+            const float hunger = std::clamp(1.0f - d.energy / 62.0f, 0.0f, 1.0f);
+            const float ownBody = speciesBase(2) * size;
+            auto palatable = [&](int idx) {
+                if (idx < 0) return false;
+                const float preyBody = speciesBase(0) * stageScale(shrimp_[idx].stage)
+                                     * shrimp_[idx].g.size;
+                if (preyBody >= ownBody * (0.85f + 0.45f * hunger)) return false;
+                if (adultShrimp <= 1 && shrimp_[idx].stage == 2) return false;
+                return true;
+            };
+            auto nearestPrey = [&](float reach) {
+                int best = -1;
+                float bestD = reach * reach;
+                for (int s = 0; s < shrimpCount_; ++s) {
+                    if (!palatable(s)) continue;
+                    const float sdx = shrimp_[s].x - d.x;
+                    const float sdy = shrimp_[s].y - d.y;
+                    const float dd = sdx * sdx + sdy * sdy;
+                    if (dd < bestD) { bestD = dd; best = s; }
                 }
+                return best;
+            };
+            // Starvation overrides caution.  A nymph with a full gut hides
+            // from a cruising fish, but one that has not eaten for a long
+            // while takes the risk instead: sitting in cover until it starves
+            // is not a survival strategy either.  With several fish patrolling
+            // a bottle this narrow, "a fish is nearby" is true most of the
+            // time, so the old absolute rule kept the whole brood pinned to
+            // stems and turned every lean spell into a one-way decline.
+            const float hungerRisk = std::clamp((52.0f - d.energy) / 30.0f, 0.0f, 1.0f);
+            const bool hideFromFish = nearFish && hungerRisk < 0.55f;
+            // A fed nymph does not hunt.  The old gate kept every nymph on the
+            // prowl until it was almost full, so a brood of ten patrolled the
+            // bottle non-stop and could take a herd of fourteen shrimp down to
+            // a handful in under a minute.  Hunting only when genuinely hungry
+            // spreads the pressure out and leaves the survivors room to breed.
+            const bool hungry = d.energy < 62.0f;
+            if ((!resting_ || d.energy < 55.0f) && !hideFromFish && light_ < 60.0f
+                && shrimpCount_ > 3 && hungry) {
+                target = nearestPrey(76.0f);
             }
 
-            const bool moribund = d.health < 0.25f;
+            // A weakened nymph stops chasing, but it still snaps at prey that
+            // drifts within reach.  Treating "below a quarter health" as "never
+            // eats again" turned every bad night into an irreversible death
+            // sentence: the animal could no longer earn the energy its own
+            // recovery needs, so the whole brood could be written off in one
+            // event no matter how calm the bottle was afterwards.
+            const bool moribund = d.health < 0.25f && target < 0;
             // A nymph does not cling the whole night through.  Each individual
             // follows a slow rhythm of resting on a stem and patrolling, so
             // part of the brood is always on the move and the colony cannot
@@ -3566,6 +3663,67 @@ private:
                 + static_cast<float>(d.id % 360u) * 0.0175f);
             const bool clinging = (resting_ && d.energy > 62.0f && restWave > 0.0f)
                                || (light_ > 60.0f && restWave > 0.45f);
+            // The strike itself is shared by the chasing nymph and the one
+            // sitting in cover: an ambush predator still takes whatever walks
+            // past its jaws, it simply does not go looking for it.
+            auto tryCatch = [&](int prey, float reach, float odds) {
+                if (prey < 0 || d.huntCooldown > 0.0f || shrimpCount_ <= 1) return false;
+                const float cdx = shrimp_[prey].x - d.x;
+                const float cdy = shrimp_[prey].y - d.y;
+                if (cdx * cdx + cdy * cdy > reach * reach) return false;
+                const float shelter = std::clamp(plantShelterAt(shrimp_[prey].x)
+                    + duckweedShelterAt(shrimp_[prey].x, shrimp_[prey].y), 0.0f, 1.0f);
+                const float dilution = 1.0f / (1.0f
+                    + 0.20f * juvenileShrimpNear(shrimp_[prey].x, shrimp_[prey].y, prey));
+                // Wrestling down prey almost as large as itself is harder
+                // than snapping up a hatchling, so the odds fall as the two
+                // bodies approach the same size.
+                const float ratio = std::clamp(speciesBase(0)
+                    * stageScale(shrimp_[prey].stage) * shrimp_[prey].g.size
+                    / (speciesBase(2) * size), 0.0f, 1.0f);
+                const float grip = std::clamp(1.25f - 0.55f * ratio, 0.40f, 1.0f);
+                // Predator pit: a Holling curve with a floor still hands a
+                // nymph a catch at any prey density, so a brood could pick off
+                // the last shrimp one recruit at a time and never let the herd
+                // rebuild.  Sparse prey is hard to find in a real jar -- the
+                // survivors hide in the weed and the search time between
+                // encounters explodes -- so capture falls away to nothing below
+                // a few shrimp.
+                const float preyRefuge = std::clamp(
+                    (static_cast<float>(shrimpCount_) - 2.0f) / 6.0f, 0.0f, 1.0f);
+                bool ate = false;
+                if (rnd(0.0f, 1.0f) < odds * (1.0f - 0.35f * shelter) * dilution * grip
+                                          * functionalResponse2(shrimpCount_, 4.0f, 10.0f)
+                                          * preyRefuge) {
+                    removeShrimp(prey, false);
+                    d.energy = std::min(100.0f, d.energy + 16.0f);
+                    d.growth = std::min(1.0f, d.growth + 0.030f);
+                    ate = true;
+                }
+                // Only a real catch earns the long digestion pause.  A miss
+                // that also shuts the nymph out of patrol for ten seconds is
+                // how a lean brood starves itself while standing next to food.
+                // The pause after a meal is long because a fed nymph simply
+                // does not hunt again until the gut is empty; that is also
+                // what stops one individual from working through a herd.
+                d.huntCooldown = ate ? rnd(26.0f, 40.0f) : rnd(1.2f, 2.2f);
+                return ate;
+            };
+            // Strike whatever drifts within a body length, whether the nymph is
+            // chasing it, hiding from a fish or lying half dead in the silt.
+            // A nymph is an ambush hunter: it does not out-swim a shrimp over
+            // open water, so a strike that only happens after a successful
+            // six-pixel chase almost never lands and the lean individuals
+            // starve while visibly stalking prey.
+            if (d.huntCooldown <= 0.0f) {
+                const int strike = nearestPrey(12.0f);
+                if (strike >= 0) {
+                    tryCatch(strike, 12.0f, 0.60f);
+                    // A catch reshuffles the shrimp array, so this frame's
+                    // chase target cannot be trusted any more.
+                    target = -1;
+                }
+            }
             if (moribund) {
                 // Moribund damselfly: it no longer hunts.  It clings to the
                 // nearest stem and sways with the water until it dies.
@@ -3587,7 +3745,7 @@ private:
                     d.vx -= d.vx * damp;
                     d.vy -= d.vy * damp;
                 }
-            } else if (nearFish || clinging || d.startleTimer > 0.0f) {
+            } else if (hideFromFish || clinging || d.startleTimer > 0.0f) {
                 // Cling to its own stem, offset sideways by an amount that
                 // depends on the individual, so several nymphs on one shoot
                 // spread along the leaves instead of sharing the same pixels.
@@ -3626,23 +3784,10 @@ private:
                     d.vx += (dx / dist * sp - d.vx) * std::min(1.0f, dt * 0.85f);
                     d.vy += (dy / dist * sp * 0.40f - d.vy) * std::min(1.0f, dt * 0.85f);
                 }
-                if (dist < 6.0f && d.huntCooldown <= 0.0f && shrimpCount_ > 1) {
-                    const float shelter = std::clamp(plantShelterAt(shrimp_[target].x)
-                        + duckweedShelterAt(shrimp_[target].x, shrimp_[target].y),
-                        0.0f, 1.0f);
-                    const float dilution = 1.0f / (1.0f
-                        + 0.20f * juvenileShrimpNear(shrimp_[target].x,
-                                                     shrimp_[target].y, target));
-                    if (rnd(0.0f, 1.0f) < 0.66f * (1.0f - 0.35f * shelter)
-                                              * dilution
-                                              * functionalResponse2(shrimpCount_, 4.0f, 10.0f)) {
-                        removeShrimp(target, false);
-                        d.energy = std::min(100.0f, d.energy + 16.0f);
-                        d.growth = std::min(1.0f, d.growth + 0.030f);
-                    }
-                    d.huntCooldown = rnd(8.0f, 13.0f);
-                    d.targetShrimp = -1;
-                    d.hunting = false;
+                if (dist < 1.5f) {
+                    // Already on top of it; hold position until the cooldown
+                    // from the last strike expires.
+                    d.hunting = true;
                 }
             } else {
                 d.hunting = false;
@@ -3657,7 +3802,14 @@ private:
                                      ? std::clamp(d.x + rnd(-55.0f, 55.0f), 20.0f, 280.0f)
                                      : damselStemX(d.x, d.id) + rnd(-9.0f, 9.0f);
                     d.targetX = std::clamp(roam, 11.0f, 293.0f);
-                    d.targetY = std::clamp(rnd(28.0f, 68.0f)
+                    // A hungry nymph works the silt, where the worms are,
+                    // instead of patrolling open water that has nothing in it
+                    // small enough to eat.  Adults do this too: once they have
+                    // outgrown shrimp-sized prey the mud is their only table.
+                    const float roamY = (d.energy < 58.0f)
+                                      ? rnd(64.0f, 82.0f)
+                                      : rnd(28.0f, 68.0f);
+                    d.targetY = std::clamp(roamY
                                            - nightO2Lift(d.x, d.y)
                                            + dielDepthBias(8.0f),
                                            damselGoalMinY, damselGoalMaxY);
@@ -3735,15 +3887,20 @@ private:
             cellAtMut(d.x, d.y).preyScent += dt * 0.30f;
             if (d.stage == 2) cellAtMut(d.x, d.y).breedScent += dt * 0.07f;
 
-            // Juvenile damselflies also pick tubifex from the mud.
-            if ((!resting_ || d.energy < 80.0f) && !moribund && d.stage == 0
-                && d.energy < 82.0f && d.huntCooldown <= 0.0f) {
-                const int ti = nearestTubifexIndex(d.x, d.y, 14.0f);
-                if (ti >= 0 && rnd(0.0f, 1.0f) < functionalResponse3(tubifexCount_, 2.5f, 6.0f)) {
+            // Damselfly nymphs also grub worms out of the mud.  Every instar
+            // does this, adults included: an adult that had outgrown the
+            // shrimp and could not reach the silt was left with no food at all,
+            // and the whole mature half of the brood starved together while
+            // twenty tubifex sat inches below it.  The reach covers the drop
+            // from the lowest swimming band (y 84) to the mud surface.
+            if ((!resting_ || d.energy < 70.0f) && !moribund
+                && d.energy < 78.0f && d.huntCooldown <= 0.0f) {
+                const int ti = nearestTubifexIndex(d.x, d.y, 26.0f);
+                if (ti >= 0 && rnd(0.0f, 1.0f) < 0.75f * functionalResponse3(tubifexCount_, 2.5f, 6.0f)) {
                     removeTubifex(ti);
-                    d.energy = std::min(100.0f, d.energy + 10.0f);
+                    d.energy = std::min(100.0f, d.energy + 12.0f);
                     d.growth = std::min(1.0f, d.growth + 0.045f);
-                    d.huntCooldown = rnd(9.0f, 15.0f);
+                    d.huntCooldown = rnd(18.0f, 28.0f);
                 }
             }
 
@@ -3768,18 +3925,20 @@ private:
                 }
             }
 
+            const float relief = rareSpeciesRelief(damselCount_, g_settings.maxDamsel);
             const float localStress = localStressAt(d.x, d.y, 2, d.g);
-            d.health -= dt * localStress * 0.0038f;
+            d.health -= dt * stressDamage(localStress) * 0.0115f * relief;
             d.energy = std::max(0.0f, d.energy - dt * localStress * 0.055f);
             const float hypoxia = std::clamp((22.0f - oxygen_) / 22.0f, 0.0f, 1.0f);
             const float tolerance = d.g.oxygen * (0.92f + 0.08f * d.g.size) * toleranceScale(d.growth);
-            if (hypoxia > 0.0f) d.health -= dt * hypoxia * 0.0035f / tolerance;
+            if (hypoxia > 0.0f) d.health -= dt * hypoxia * 0.0035f * relief / tolerance;
             if (d.energy <= 0.0f) d.health -= dt * 0.0080f;
             const float lifespan = 330.0f * lifespanScale(d.g, d.id);
             if (d.age > lifespan) {
                 d.health -= dt * 0.0012f;
-            } else if (d.health < 1.0f && d.energy > 42.0f && localStress < 0.22f) {
-                d.health = std::min(1.0f, d.health + dt * 0.0016f);
+            } else if (d.health < 1.0f && d.energy > 35.0f && localStress < 0.70f) {
+                const float calm = 1.0f - localStress / 0.70f;
+                d.health = std::min(1.0f, d.health + dt * (0.0008f + 0.0022f * calm));
             }
 
             if (d.health <= 0.0f) {
@@ -3790,6 +3949,11 @@ private:
             if (d.stage == 2 && d.health > 0.40f && d.energy >= 60.0f
                 && d.breedCooldown <= 0.0f && oxygen_ > 54.0f
                 && plantCount_ >= 3
+                // Recruitment is food-limited.  Ten nymphs can strip a jar
+                // this size before they mature, so an adult only lays while
+                // there is a standing prey base to feed the brood: shrimp are
+                // the staple, tubifex a coarser fallback.
+                && shrimpCount_ + tubifexCount_ / 10 >= 7
                 && damselCount_ < g_settings.maxDamsel && eggCount_ < kMaxEggs
                 && localStressAt(d.x, d.y, 2, d.g) < 0.65f) {
                 if (layEgg(2, childGenes(d.g), d.x)) {
@@ -3888,7 +4052,8 @@ private:
 
             int kind = -1, index = -1;
             if ((!resting_ || f.energy < 55.0f) && !brightHide && !startled
-                && intruder < 0 && f.health > 0.28f && f.energy < 95.0f) {
+                && intruder < 0 && (f.health > 0.28f || f.energy < 30.0f)
+                && f.energy < 95.0f) {
                 if (f.retargetTimer > 0.0f && f.targetKind >= 0) {
                     kind = f.targetKind;
                     index = f.targetIndex;
@@ -3984,6 +4149,7 @@ private:
                 }
                 if (dist < 6.5f && f.huntCooldown <= 0.0f) {
                     const bool canEat = (kind == 0) ? shrimpCount_ > 2 : damselCount_ > 1;
+                    bool ate = false;
                     if (canEat) {
                         const float preyY = (kind == 0) ? shrimp_[index].y
                                                        : damsel_[index].y;
@@ -4005,16 +4171,22 @@ private:
                             else removeDamsel(index, false);
                             f.energy = std::min(100.0f, f.energy + 18.0f);
                             f.growth = std::min(1.0f, f.growth + 0.045f);
+                            ate = true;
                         }
                     }
-                    f.huntCooldown = rnd(9.0f, 14.0f);
+                    // A miss must not lock the fish out of every other food
+                    // for ten seconds.  Only a real capture earns the long
+                    // digestion pause; otherwise it simply tries again.
+                    f.huntCooldown = ate ? rnd(9.0f, 14.0f) : rnd(1.4f, 2.4f);
                     f.hunting = false;
                 }
             } else {
                 f.hunting = false;
                 f.chaseFish = -1;
-                if (f.health < 0.28f) {
-                    // Dying fish loses equilibrium and drifts near the surface.
+                // A dying fish loses equilibrium and drifts near the surface,
+                // but a starving one still rises for duckweed: drifting is a
+                // sign of the end, not a licence to skip every meal on the way.
+                if (f.health < 0.28f && f.energy > 20.0f) {
                     f.targetX = std::clamp(f.x + std::sin(animTime_ * 0.35f + i * 1.3f) * 6.0f,
                                            kFishMinX, kFishMaxX);
                     f.targetY = fishGoalMinY;
@@ -4153,17 +4325,19 @@ private:
             if (f.territory) cellAtMut(f.x, f.y).breedScent += dt * 0.12f;
 
             const float localStress = localStressAt(f.x, f.y, 1, f.g);
-            f.health -= dt * localStress * 0.0040f;
+            const float relief = rareSpeciesRelief(fishCount_, g_settings.maxFish);
+            f.health -= dt * stressDamage(localStress) * 0.0110f * relief;
             f.energy = std::max(0.0f, f.energy - dt * localStress * 0.060f);
             const float hypoxia = std::clamp((22.0f - oxygen_) / 22.0f, 0.0f, 1.0f);
             const float tolerance = f.g.oxygen * (0.92f + 0.08f * f.g.size) * toleranceScale(f.growth);
-            if (hypoxia > 0.0f) f.health -= dt * hypoxia * 0.0035f / tolerance;
+            if (hypoxia > 0.0f) f.health -= dt * hypoxia * 0.0035f * relief / tolerance;
             if (f.energy <= 0.0f) f.health -= dt * 0.0120f;
             const float lifespan = 380.0f * lifespanScale(f.g, f.id);
             if (f.age > lifespan) {
                 f.health -= dt * 0.0012f;
-            } else if (f.health < 1.0f && f.energy > 42.0f && localStress < 0.22f) {
-                f.health = std::min(1.0f, f.health + dt * 0.0016f);
+            } else if (f.health < 1.0f && f.energy > 35.0f && localStress < 0.70f) {
+                const float calm = 1.0f - localStress / 0.70f;
+                f.health = std::min(1.0f, f.health + dt * (0.0008f + 0.0022f * calm));
             }
 
             if (f.health <= 0.0f) {
@@ -4261,11 +4435,14 @@ private:
             w.growth = std::min(1.0f, w.growth + decomposition * 0.04f * dt);
 
             const float wormStress = localStressAt(w.x, 92.0f, 3, w.g);
-            w.health -= dt * wormStress * 0.0040f;
+            w.health -= dt * stressDamage(wormStress) * 0.0100f;
             w.energy = std::max(0.0f, w.energy - dt * wormStress * 0.035f);
             if (w.energy <= 0.0f) w.health -= dt * 0.0060f;
             if (w.age > 320.0f * (0.85f + 0.15f * w.g.size)) {
                 w.health -= dt * 0.0015f;
+            } else if (w.health < 1.0f && w.energy > 30.0f && wormStress < 0.70f) {
+                const float calm = 1.0f - wormStress / 0.70f;
+                w.health = std::min(1.0f, w.health + dt * (0.0008f + 0.0020f * calm));
             }
             if (w.health <= 0.0f) {
                 killWorm(i);
@@ -4298,8 +4475,12 @@ private:
                                   - dt * 0.08f * lowO2, 0.0f, 100.0f);
             const float tubifexStress = localStressAt(t.x, t.y, 4, t.g);
             t.health -= dt * (0.0020f + 0.020f * lowO2
-                              + tubifexStress * 0.0045f)
+                              + stressDamage(tubifexStress) * 0.0100f)
                       / std::max(0.6f, t.g.oxygen);
+            if (t.health < 1.0f && t.energy > 30.0f && tubifexStress < 0.70f) {
+                const float calm = 1.0f - tubifexStress / 0.70f;
+                t.health = std::min(1.0f, t.health + dt * (0.0008f + 0.0020f * calm));
+            }
             t.growth = std::min(1.0f, t.growth + dt * 0.006f * localFood
                                  + maturationStep(t.energy, t.health, 0.0040f, dt));
             t.stage = stageFromGrowth(t.growth);
@@ -4360,12 +4541,15 @@ private:
                 continue;
             }
 
-            if (t.health > 0.40f && t.breedCooldown <= 0.0f && t.energy > 82.0f
+            if (t.health > 0.40f && t.breedCooldown <= 0.0f && t.energy > 74.0f
                 && localFood > 0.66f && oxygen_ > 36.0f
                 && tubifexCount_ < g_settings.maxTubifex) {
                 spawnTubifex(t.x + rnd(-10.0f, 10.0f), childGenes(t.g));
                 t.energy -= 30.0f;
-                t.breedCooldown = rnd(90.0f, 140.0f);
+                // They are the jar's detritivore channel, so they multiply
+                // while the mud is rich.  Once the nymphs start cropping them
+                // this is the term that replaces what was eaten.
+                t.breedCooldown = rnd(55.0f, 85.0f);
             }
         }
     }
@@ -4401,17 +4585,25 @@ private:
     }
 
     void updateSediment(float dt) {
-        // Humus is slowly mineralized into the local sediment bed.
-        const float transfer = std::min(humus_, dt * 0.018f);
-        humus_ = std::max(0.0f, humus_ - transfer);
-        // Mineralisation also liberates dissolved phosphorus.  The ratio is
-        // deliberately high so the phosphate channel closes the loop instead
-        // of draining to its floor over a long run.
-        phosphorus_ = std::min(100.0f, phosphorus_ + transfer * 0.85f);
+        // Silt and the detritus blanket above it are one pool seen at two
+        // depths: waste settles into the bed and the bed is worked over and
+        // slowly redissolved by roots, worms and the microbial loop.  Writing
+        // that exchange as a relaxation keeps each bin near the detritus load
+        // that feeds it.
+        //
+        // The old form turned every unit of humus into a hundred units of
+        // silt.  Nothing else in the budget works at that scale, so after a
+        // few minutes all sixteen bins sat at 100, the bed ran anoxic for the
+        // rest of the run, and the toxin it produced killed the worms that
+        // were supposed to keep the humus down.
+        const float target = std::clamp(20.0f + humus_ * 0.45f, 20.0f, 72.0f);
+        const float relax = std::min(1.0f, dt * 0.060f);
         for (int i = 0; i < kSedimentBins; ++i) {
-            sediment_[i] = std::min(100.0f,
-                sediment_[i] + transfer * 100.0f / kSedimentBins);
+            sediment_[i] += (target - sediment_[i]) * relax;
         }
+        // Mineralisation liberates a little dissolved phosphorus on the way.
+        phosphorus_ = std::min(100.0f, phosphorus_ + dt * 0.020f
+                               * std::clamp(humus_ / 40.0f, 0.0f, 1.0f));
         // Gentle lateral diffusion, so a corpse enriches a small neighborhood.
         const float diffusion = 0.018f * dt;
         for (int i = 0; i < kSedimentBins; ++i) {
@@ -4535,7 +4727,8 @@ private:
                                                   0.0f, 1.0f);
                 MicroCell& c = gridScratch_[gy * kGridW + gx];
                 c.tannin = std::clamp(c.tannin
-                    + tick * (0.018f * organic + 0.004f - 0.006f * shade
+                    + tick * (0.012f * organic + 0.003f - 0.004f * shade
+                              - 0.0010f * c.tannin
                               + eventTanninRate_ + 0.004f * bankWash_ * bankEdge),
                     0.0f, 82.0f);
                 c.light = std::clamp(light_ * (1.0f - 0.52f * shade)
@@ -4556,9 +4749,13 @@ private:
                 c.aerobic = std::clamp(c.aerobic
                     + tick * (0.17f * q10 * (c.o2 / 100.0f) * organic
                               - 0.055f * c.aerobic), 0.0f, 1.0f);
+                // Oxygen demand of the detritus blanket.  Decay has to be able
+                // to keep up with production, otherwise every cell below about
+                // half saturation sat at anaerobic = 1 for the whole run and
+                // the bed produced toxin without pause.
                 c.anaerobic = std::clamp(c.anaerobic
-                    + tick * (0.13f * q10 * (1.0f - c.o2 / 100.0f) * organic
-                              - 0.030f * c.anaerobic), 0.0f, 1.0f);
+                    + tick * (0.070f * q10 * (1.0f - c.o2 / 100.0f) * organic
+                              - 0.048f * c.anaerobic), 0.0f, 1.0f);
                 c.toxin = std::clamp(c.toxin
                     + tick * (c.anaerobic * 0.055f * q10 - c.toxin * 0.020f
                               + eventToxinRate_ * q10),
@@ -4649,12 +4846,28 @@ private:
         return std::clamp((temperature_ - 23.0f) / 3.0f, 0.0f, 1.0f);
     }
 
+    // Chronic background stress is survivable.  Only the part that climbs
+    // above an animal's tolerance actually injures it; below that line the
+    // price is paid in energy and in spawning.  Without this floor a merely
+    // mediocre patch of water -- a little tannin, a little silt, a little
+    // crowding -- subtracted health every single second, and since no cell
+    // ever returns to pristine the whole standing crop was ground down to
+    // zero on a fixed schedule.
+    static float stressDamage(float stress) {
+        return std::max(0.0f, stress - 0.55f);
+    }
+
     float localStressAt(float x, float y, int kind, const Genes& g) const {
         const MicroCell& c = cellAt(x, y);
         const float lowO2 = std::clamp((42.0f - c.o2) / 42.0f, 0.0f, 1.0f);
         const float tanninHigh = std::clamp((c.tannin - 34.0f) / 46.0f, 0.0f, 1.0f);
         const float toxin = std::clamp(c.toxin / 24.0f, 0.0f, 1.0f);
-        const float same = std::clamp((c.speciesDensity[kind] - 2.0f) / 4.0f,
+        // Benthic species all share one narrow strip of mud at the bottom of
+        // the same 20 px column, so ten worms genuinely live in one cell.  Read
+        // their crowding on a coarser scale, or a healthy bed always scores as
+        // maximally overcrowded.
+        const float crowdScale = (kind >= 3) ? 9.0f : 4.0f;
+        const float same = std::clamp((c.speciesDensity[kind] - 3.0f) / crowdScale,
                                       0.0f, 1.0f);
         const float prefY = (kind == 1) ? 42.0f : (kind == 2) ? 62.0f
                           : (kind == 0) ? 72.0f : 90.0f;
@@ -4830,7 +5043,10 @@ private:
         }
 
         if (damselEggs_ > 0 && damselCount_ < g_settings.maxDamsel && oxygen_ > 44.0f
-            && plantCount_ >= 3) {
+            && plantCount_ >= 3
+            // Same food gate as laying: during a prey trough the dormant
+            // clutch simply waits, then resumes once the shrimp herd is back.
+            && shrimpCount_ + tubifexCount_ / 10 >= 6) {
             damselEggTimer_ += dt;
             if (damselEggTimer_ >= 30.0f) {
                 damselEggTimer_ = 0.0f;
@@ -4897,10 +5113,10 @@ private:
         if (tubifexCount_ > 0 && rnd(0.0f, 1.0f) < dt * 0.006f) {
             tubifexEggs_ = std::min(6, tubifexEggs_ + 1);
         }
-        if (tubifexCount_ < 3 && tubifexEggs_ > 0
+        if (tubifexCount_ < 6 && tubifexEggs_ > 0
             && sedimentAtX(160.0f) > 26.0f) {
             tubifexEggTimer_ += dt;
-            if (tubifexEggTimer_ >= 75.0f) {
+            if (tubifexEggTimer_ >= 55.0f) {
                 tubifexEggTimer_ = 0.0f;
                 spawnTubifex(rnd(24.0f, 296.0f), makeGenes(1.0f));
                 --tubifexEggs_;
@@ -4937,7 +5153,11 @@ private:
                                      * (0.045f + 0.040f * (1.0f - light_ / 100.0f))
                                      * (1.0f + 0.25f * night_);
         const float oxygenFactor = std::clamp((oxygen_ - 18.0f) / 55.0f, 0.0f, 1.0f);
-        const float respirationScale = 0.42f + 0.58f * oxygenFactor;
+        // Animals slide into hypoxic dormancy instead of burning the last of
+        // the oxygen.  Metabolism falls away steeply below half saturation, so
+        // a warm night can no longer spiral from "a little low" into a dead
+        // bottle; the whole community simply breathes less until dawn.
+        const float respirationScale = 0.10f + 0.90f * oxygenFactor * oxygenFactor;
         const float shrimpResp = static_cast<float>(shrimpCount_)
                                * (0.09f + 0.08f * activity) * respirationScale;
         const float damselResp = static_cast<float>(damselCount_)
@@ -4947,6 +5167,13 @@ private:
         const float wormResp = static_cast<float>(wormCount_) * 0.030f * respirationScale;
         const float tubifexResp = static_cast<float>(tubifexCount_) * 0.006f
                                 * respirationScale;
+        // Aerobic decay burns oxygen too.  Without this term the new
+        // mineralization would be free energy for the jar; with it, a heavy
+        // detritus load slightly depresses oxygen, which then slows the decay
+        // itself -- the natural brake.
+        const float bacterialResp = 0.045f
+            * std::clamp((humus_ - 6.0f) / 34.0f, 0.0f, 1.0f)
+            * std::clamp((oxygen_ - 16.0f) / 56.0f, 0.0f, 1.0f);
         const float saturation = 76.0f - 0.65f * (temperature_ - 22.0f);
         const float surfaceExchange = (saturation - oxygen_) * 0.060f;
         const float wetSeason = std::clamp(-seasonWater_ / 9.0f, -1.0f, 1.0f);
@@ -4954,6 +5181,7 @@ private:
         oxygen_ += dt * (photosynthesis + duckweedPhoto - duckweedResp
                          - plantRespiration - shrimpResp
                          - damselResp - fishResp - wormResp - tubifexResp
+                         - bacterialResp
                          - 0.12f + surfaceExchange + 0.10f * wetSeason
                          + eventO2Rate_);
         oxygen_ = std::clamp(oxygen_, 0.0f, 100.0f);
@@ -4964,6 +5192,26 @@ private:
                       + static_cast<float>(fishCount_) * 0.010f
                       + static_cast<float>(damselCount_) * 0.007f
                       + eventHumusRate_);
+        // Bacterial mineralization.  The worm was the only real decomposer,
+        // so whenever the benthos was knocked back the humus simply piled up
+        // to the cap: the micro-grid then read organic = 1, the bottom layer
+        // went anaerobic and pumped toxin into the silt, which killed the
+        // worms -- a closed loop with no way out.  A slow community of
+        // aerobic bacteria consumes detritus whether or not a worm is
+        // present, faster when the water is well oxygenated and almost not
+        // at all in anoxic silt, and hands the nitrogen back to the column.
+        // Aerobic decay carries most of the load, but the mud never stops
+        // working: anaerobic bacteria keep breaking detritus down (slowly, and
+        // at the cost of the reduced compounds the grid already models).  With
+        // a purely aerobic term a single bad night shut decay down completely,
+        // and the humus then cemented itself at the cap where nothing could
+        // reach it.
+        const float aerobic = 0.18f
+            + 0.82f * std::clamp((oxygen_ - 16.0f) / 56.0f, 0.0f, 1.0f);
+        const float humusSubstrate = std::clamp((humus_ - 6.0f) / 34.0f, 0.0f, 1.0f);
+        const float mineralized = dt * 0.40f * humusSubstrate * aerobic;
+        humus_ = std::max(0.0f, humus_ - mineralized);
+        nutrient_ = std::min(100.0f, nutrient_ + mineralized * 0.85f);
         // Nutrient events carry a signed rate: rain and overturn feed the
         // column, drought and algal blooms draw it down.  Apply it once, with
         // the same sign convention the micro-grid uses.

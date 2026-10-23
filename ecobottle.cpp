@@ -1577,10 +1577,17 @@ public:
         debugTimer_ += dt;
         if (debugTimer_ >= 10.0f) {
             debugTimer_ = 0.0f;
+            float hpMin = 1.0f, hpSum = 0.0f;
+            int hpN = 0;
+            auto sampleHp = [&](float v) { hpMin = std::min(hpMin, v); hpSum += v; ++hpN; };
+            for (int i = 0; i < shrimpCount_; ++i) sampleHp(shrimp_[i].health);
+            for (int i = 0; i < damselCount_; ++i) sampleHp(damsel_[i].health);
+            for (int i = 0; i < fishCount_; ++i) sampleHp(fish_[i].health);
             std::fprintf(stderr,
                 "[sim] t=%5.0f light=%5.1f O2=%5.1f humus=%5.1f nut=%5.1f "
                 "night=%4.2f plants=%d shrimp=%d damsel=%d fish=%d worms=%d "
-                "tubifex=%d corpses=%d eggs=%d/%d/%d lay=%d temp=%4.1f day=%4.2f sed=%4.1f terr=%d\n",
+                "tubifex=%d corpses=%d eggs=%d/%d/%d lay=%d temp=%4.1f day=%4.2f sed=%4.1f terr=%d "
+                "ev=%d:%d:%d hp=%4.2f/%4.2f\n",
                 static_cast<double>(simTime_), static_cast<double>(light_),
                 static_cast<double>(oxygen_), static_cast<double>(humus_),
                 static_cast<double>(nutrient_), static_cast<double>(night_),
@@ -1588,7 +1595,12 @@ public:
                 tubifexCount_, corpseCount_, fishEggs_, damselEggs_, shrimpEggs_,
                 eggCount_, static_cast<double>(temperature_),
                 static_cast<double>(daylight_),
-                static_cast<double>(sedimentAtX(160.0f)), territoryCount());
+                static_cast<double>(sedimentAtX(160.0f)), territoryCount(),
+                eventCount_ > 0 ? events_[0].type : -1,
+                eventCount_ > 1 ? events_[1].type : -1,
+                eventCount_ > 2 ? events_[2].type : -1,
+                static_cast<double>(hpMin),
+                static_cast<double>(hpN > 0 ? hpSum / static_cast<float>(hpN) : 1.0f));
         }
 #endif
     }
@@ -2500,6 +2512,16 @@ private:
     static float toleranceScale(float growth) {
         return 1.35f - 0.35f * std::clamp(growth, 0.0f, 1.0f);
     }
+    // Individual longevity, not a brood-wide number.  Siblings that hatch in
+    // the same clutch used to reach old age on the same day and die together;
+    // a small, stable spread per individual keeps the deaths staggered so a
+    // single generation cannot vanish all at once.
+    static float lifespanScale(const Genes& g, std::uint32_t id) {
+        const float base = 0.85f + 0.15f * g.size;
+        const float spread = 0.86f + 0.28f
+            * static_cast<float>(art::hash2(static_cast<int>(id), 17) % 1000u) / 1000.0f;
+        return base * spread;
+    }
     static float plantTypeO2(int type) {
         return (type == 1 ? 1.25f : (type == 2 ? 0.95f : 0.70f));
     }
@@ -2651,6 +2673,34 @@ private:
             if (s < score) { score = s; best = plants_[i].x; }
         }
         return best;
+    }
+
+    // Stem for a nymph.  Its own nearest stalk is what a settling larva would
+    // choose, but every individual also prefers one plant in a stable rotation
+    // of the colony, so a brood spreads along the vegetation instead of all
+    // piling onto the single closest tall shoot.
+    float damselStemX(float x, uint32_t id) const {
+        int viable = 0;
+        for (int i = 0; i < plantCount_; ++i)
+            if (!plants_[i].dying) ++viable;
+        if (viable <= 0) return nearestPlantX(x, true);
+        const int want = static_cast<int>(id % static_cast<uint32_t>(viable));
+        int seen = 0;
+        float chosen = x;
+        float bestScore = 1e9f;
+        for (int i = 0; i < plantCount_; ++i) {
+            const Plant& p = plants_[i];
+            if (p.dying) continue;
+            float s = std::fabs(p.x - x);
+            if (p.type == 1) s -= 20.0f;
+            // The assigned stem outweighs travel distance: a larva spreading
+            // to its own shoot is the point, even when that means crossing
+            // some open water.
+            if (seen == want) s -= 120.0f;
+            ++seen;
+            if (s < bestScore) { bestScore = s; chosen = p.x; }
+        }
+        return chosen;
     }
 
     int nearestPlant(float x) const {
@@ -3377,8 +3427,17 @@ private:
             const float tolerance = s.g.oxygen * (0.92f + 0.08f * s.g.size) * toleranceScale(s.growth);
             if (hypoxia > 0.0f) s.health -= dt * hypoxia * 0.0040f / tolerance;
             if (s.energy <= 0.0f) s.health -= dt * 0.0090f;
-            if (s.age > 300.0f * (0.85f + 0.15f * s.g.size)) {
+            const float lifespan = 300.0f * lifespanScale(s.g, s.id);
+            if (s.age > lifespan) {
                 s.health -= dt * 0.0012f;
+            } else if (s.health < 1.0f && s.energy > 42.0f && localStress < 0.22f) {
+                // Healing is what makes the cycle robust.  When health could
+                // only ever fall, a run of poor nights dragged every shrimp,
+                // nymph and fish down at the same rate, so all three lineages
+                // died within minutes of each other and the bottle went empty.
+                // A body that has not reached its own lifespan mends in benign
+                // water, so a bad spell is survived instead of accumulating.
+                s.health = std::min(1.0f, s.health + dt * 0.0016f);
             }
 
             if (s.health <= 0.0f) {
@@ -3386,8 +3445,13 @@ private:
                 continue;
             }
 
+            // Breeding wants well-oxygenated water, not merely survivable
+            // water.  Laying at 44% saturation built a crowd the jar could not
+            // oxygenate, and the whole standing crop then slid downhill at the
+            // same rate.  A higher spawning threshold makes the population
+            // stop growing before the nightly oxygen debt does.
             if (s.stage == 2 && s.health > 0.40f && s.energy >= 52.0f
-                && s.breedCooldown <= 0.0f && oxygen_ > 44.0f
+                && s.breedCooldown <= 0.0f && oxygen_ > 52.0f
                 && plantCount_ >= 3 && shrimpCount_ < g_settings.maxShrimp
                 && eggCount_ < kMaxEggs
                 && localStressAt(s.x, s.y, 0, s.g) < 0.65f) {
@@ -3494,6 +3558,14 @@ private:
             }
 
             const bool moribund = d.health < 0.25f;
+            // A nymph does not cling the whole night through.  Each individual
+            // follows a slow rhythm of resting on a stem and patrolling, so
+            // part of the brood is always on the move and the colony cannot
+            // settle into one knot on the same plant.
+            const float restWave = std::sin(simTime_ * 0.045f
+                + static_cast<float>(d.id % 360u) * 0.0175f);
+            const bool clinging = (resting_ && d.energy > 62.0f && restWave > 0.0f)
+                               || (light_ > 60.0f && restWave > 0.45f);
             if (moribund) {
                 // Moribund damselfly: it no longer hunts.  It clings to the
                 // nearest stem and sways with the water until it dies.
@@ -3501,7 +3573,7 @@ private:
                 d.hunting = false;
                 d.targetShrimp = -1;
                 const float stem = nearestPlantX(d.x, true);
-                const float tx = std::clamp(stem >= 0.0f ? stem : d.x, 11.0f, 293.0f);
+                const float tx = std::clamp(stem, 11.0f, 293.0f);
                 const float ty = std::clamp(d.y, 42.0f, 70.0f);
                 const float dx = tx - d.x;
                 const float dy = ty - d.y;
@@ -3515,15 +3587,19 @@ private:
                     d.vx -= d.vx * damp;
                     d.vy -= d.vy * damp;
                 }
-            } else if (nearFish || (resting_ && d.energy > 70.0f)
-                       || light_ > 60.0f || d.startleTimer > 0.0f) {
+            } else if (nearFish || clinging || d.startleTimer > 0.0f) {
+                // Cling to its own stem, offset sideways by an amount that
+                // depends on the individual, so several nymphs on one shoot
+                // spread along the leaves instead of sharing the same pixels.
+                const float side = (static_cast<float>(d.id % 5u) - 2.0f) * 5.0f;
                 const float tx = (d.startleTimer > 0.0f)
                                ? std::clamp(d.x + (d.x - d.startleX) * 1.6f, 11.0f, 293.0f)
-                               : std::clamp(nearestPlantX(d.x, true), 11.0f, 293.0f);
+                               : std::clamp(damselStemX(d.x, d.id) + side, 11.0f, 293.0f);
                 // A clinging nymph keeps shifting its grip along the stem
                 // instead of freezing in place, so it still reads as alive.
+                const float clingPhase = static_cast<float>(d.id % 628u) * 0.01f;
                 const float clingY = 62.0f
-                    + std::sin(simTime_ * 0.30f + static_cast<float>(i) * 1.9f) * 6.0f;
+                    + std::sin(simTime_ * 0.30f + clingPhase) * 7.0f;
                 const float ty = (d.startleTimer > 0.0f)
                                ? std::clamp(d.y + (d.y - d.startleY) * 1.4f,
                                             damselGoalMinY, damselGoalMaxY)
@@ -3572,9 +3648,15 @@ private:
                 d.hunting = false;
                 d.dirTimer -= dt;
                 if (d.dirTimer <= 0.0f) {
-                    d.dirTimer = rnd(3.0f, 8.0f);
-                    d.targetX = std::clamp(nearestPlantX(d.x, true) + rnd(-7.0f, 7.0f),
-                                           11.0f, 293.0f);
+                    d.dirTimer = rnd(6.0f, 12.0f);
+                    // Part of the time it patrols open water rather than heading
+                    // for yet another stem; otherwise a brood stays glued to the
+                    // two or three shoots it can reach and reads as one lump.
+                    // The step is a nearby limb so the nymph actually travels.
+                    const float roam = (rnd(0.0f, 1.0f) < 0.45f)
+                                     ? std::clamp(d.x + rnd(-55.0f, 55.0f), 20.0f, 280.0f)
+                                     : damselStemX(d.x, d.id) + rnd(-9.0f, 9.0f);
+                    d.targetX = std::clamp(roam, 11.0f, 293.0f);
                     d.targetY = std::clamp(rnd(28.0f, 68.0f)
                                            - nightO2Lift(d.x, d.y)
                                            + dielDepthBias(8.0f),
@@ -3611,10 +3693,10 @@ private:
                 const float dy = d.targetY - d.y;
                 const float dist = std::sqrt(dx * dx + dy * dy);
                 if (dist > 4.0f) {
-                    const float sp = 6.5f * d.g.speed * motionScale(d.growth)
+                    const float sp = 7.5f * d.g.speed * motionScale(d.growth)
                                    * std::clamp(dist / 14.0f, 0.15f, 1.0f);
-                    d.vx += (dx / dist * sp - d.vx) * std::min(1.0f, dt * 0.6f);
-                    d.vy += (dy / dist * sp * 0.35f - d.vy) * std::min(1.0f, dt * 0.6f);
+                    d.vx += (dx / dist * sp - d.vx) * std::min(1.0f, dt * 0.8f);
+                    d.vy += (dy / dist * sp * 0.35f - d.vy) * std::min(1.0f, dt * 0.8f);
                 } else {
                     const float damp = std::min(1.0f, dt * 2.0f);
                     d.vx -= d.vx * damp;
@@ -3635,6 +3717,21 @@ private:
             if (d.y >= 84.0f) d.vy = -std::fabs(d.vy);
             d.vx = std::clamp(d.vx, -16.0f, 16.0f);
             d.vy = std::clamp(d.vy, -16.0f, 16.0f);
+            // A light lateral shove keeps nymphs a body apart.  Without it a
+            // brood that shares one shoot sits in the same pixels and reads as
+            // a single clump rather than several larvae.
+            for (int j = 0; j < i; ++j) {
+                Damsel& other = damsel_[j];
+                const float ddx = other.x - d.x;
+                const float ddy = other.y - d.y;
+                if (std::fabs(ddy) > 6.0f) continue;
+                const float adx = std::fabs(ddx);
+                if (adx >= 9.0f) continue;
+                const float push = (9.0f - adx) * std::min(1.0f, dt * 2.0f) * 0.45f;
+                const float dir = (ddx >= 0.0f) ? 1.0f : -1.0f;
+                d.x = std::clamp(d.x - dir * push, 10.0f, 294.0f);
+                other.x = std::clamp(other.x + dir * push, 10.0f, 294.0f);
+            }
             cellAtMut(d.x, d.y).preyScent += dt * 0.30f;
             if (d.stage == 2) cellAtMut(d.x, d.y).breedScent += dt * 0.07f;
 
@@ -3678,8 +3775,11 @@ private:
             const float tolerance = d.g.oxygen * (0.92f + 0.08f * d.g.size) * toleranceScale(d.growth);
             if (hypoxia > 0.0f) d.health -= dt * hypoxia * 0.0035f / tolerance;
             if (d.energy <= 0.0f) d.health -= dt * 0.0080f;
-            if (d.age > 330.0f * (0.85f + 0.15f * d.g.size)) {
+            const float lifespan = 330.0f * lifespanScale(d.g, d.id);
+            if (d.age > lifespan) {
                 d.health -= dt * 0.0012f;
+            } else if (d.health < 1.0f && d.energy > 42.0f && localStress < 0.22f) {
+                d.health = std::min(1.0f, d.health + dt * 0.0016f);
             }
 
             if (d.health <= 0.0f) {
@@ -3688,8 +3788,8 @@ private:
             }
 
             if (d.stage == 2 && d.health > 0.40f && d.energy >= 60.0f
-                && d.breedCooldown <= 0.0f && oxygen_ > 46.0f
-                && shrimpCount_ >= 2 && plantCount_ >= 3
+                && d.breedCooldown <= 0.0f && oxygen_ > 54.0f
+                && plantCount_ >= 3
                 && damselCount_ < g_settings.maxDamsel && eggCount_ < kMaxEggs
                 && localStressAt(d.x, d.y, 2, d.g) < 0.65f) {
                 if (layEgg(2, childGenes(d.g), d.x)) {
@@ -4059,8 +4159,11 @@ private:
             const float tolerance = f.g.oxygen * (0.92f + 0.08f * f.g.size) * toleranceScale(f.growth);
             if (hypoxia > 0.0f) f.health -= dt * hypoxia * 0.0035f / tolerance;
             if (f.energy <= 0.0f) f.health -= dt * 0.0120f;
-            if (f.age > 380.0f * (0.85f + 0.15f * f.g.size)) {
+            const float lifespan = 380.0f * lifespanScale(f.g, f.id);
+            if (f.age > lifespan) {
                 f.health -= dt * 0.0012f;
+            } else if (f.health < 1.0f && f.energy > 42.0f && localStress < 0.22f) {
+                f.health = std::min(1.0f, f.health + dt * 0.0016f);
             }
 
             if (f.health <= 0.0f) {
@@ -4071,8 +4174,8 @@ private:
             }
 
             if (f.stage == 2 && f.health > 0.40f && f.energy >= (f.territory ? 56.0f : 58.0f)
-                && f.breedCooldown <= 0.0f && oxygen_ > 44.0f
-                && shrimpCount_ >= 2 && plantCount_ >= 3
+                && f.breedCooldown <= 0.0f && oxygen_ > 52.0f
+                && plantCount_ >= 3
                 && fishCount_ < g_settings.maxFish && eggCount_ < kMaxEggs
                 && localStressAt(f.x, f.y, 1, f.g) < 0.65f) {
                 if (layEgg(1, childGenes(f.g), f.territory ? f.territoryX : f.x)) {
@@ -4659,6 +4762,9 @@ private:
         // this the lineage could sit there until it aged out.
         auto keepBank = [&](int active, bool canReproduce, int& bank, float& timer) {
             if (active > 0 && canReproduce) { timer = 0.0f; return; }
+            // Only the dormant bank is topped up here, and it is a last resort
+            // rather than a way of life: the ordinary cycle below keeps laying
+            // fresh eggs, so the community should never need this at all.
             timer += dt;
             if (timer < wait) return;
             timer = 0.0f;
@@ -4705,8 +4811,13 @@ private:
 
     void updateEggs(float dt) {
         updateAttachedEggs(dt);
+        // Hatching and spawning never key off the shrimp population.  A hard
+        // "two shrimp alive" gate used to lock the whole bottle: after a shrimp
+        // crash the fish and damselfly banks could neither hatch nor refill, so
+        // all three lineages could sit empty at the same time.  Oxygen and
+        // plant cover are the conditions that actually matter to a recruit.
         if (fishEggs_ > 0 && fishCount_ < g_settings.maxFish && oxygen_ > 42.0f
-            && shrimpCount_ >= 2 && plantCount_ >= 3) {
+            && plantCount_ >= 3) {
             fishEggTimer_ += dt;
             if (fishEggTimer_ >= 28.0f) {
                 fishEggTimer_ = 0.0f;
@@ -4719,7 +4830,7 @@ private:
         }
 
         if (damselEggs_ > 0 && damselCount_ < g_settings.maxDamsel && oxygen_ > 44.0f
-            && shrimpCount_ >= 2 && plantCount_ >= 3) {
+            && plantCount_ >= 3) {
             damselEggTimer_ += dt;
             if (damselEggTimer_ >= 30.0f) {
                 damselEggTimer_ = 0.0f;
@@ -6519,11 +6630,21 @@ private:
         const float rain = eventStrength(0);
         if (rain > 0.06f) {
             const int drops = 6 + static_cast<int>(rain * 12.0f);
+            // One streak per horizontal lane plus a little jitter.  Pure hash
+            // placement left whole stretches of sky, especially the far left,
+            // without a single drop while the rest of the bottle was raining.
+            const int innerW = kR - kL - 6;
+            const int laneW = std::max(1, innerW / drops);
             SDL_SetRenderDrawBlendMode(r_, SDL_BLENDMODE_BLEND);
             SDL_SetRenderDrawColor(r_, art::kCream.r, art::kCream.g, art::kCream.b,
                                    static_cast<Uint8>(110));
             for (int i = 0; i < drops; ++i) {
-                const int x = kL + 4 + static_cast<int>(art::hash2(i * 13 + 3, 5) % 300u);
+                // Lane starts are spread over the whole inner width, so the
+                // last lane still reaches the right wall instead of piling up
+                // short of it.  The jitter only slides within each lane.
+                const int x = kL + 2 + (i * innerW) / drops
+                            + static_cast<int>(art::hash2(i * 13 + 3, 5)
+                                               % static_cast<uint32_t>(laneW));
                 const float span = std::max(6.0f, surface - kT - 2.0f);
                 const int y = kT + 1 + static_cast<int>(std::fmod(t * (46.0f + i * 3.0f)
                                              + i * 17.0f, span));

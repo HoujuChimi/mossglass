@@ -3149,7 +3149,7 @@ private:
                 mutatePlantStage(p);
                 if (p.stage == 2 && p.energy > 80.0f && p.health > 0.60f
                     && plantCount_ < g_settings.maxPlants && light_ > 22.0f
-                    && sedimentAtX(p.x) > 30.0f && plantStress < 0.65f) {
+                    && sedimentAtX(p.x) > 26.0f && plantStress < 0.65f) {
                     spawnPlant(p.type, p.x, p.g);
                     p.energy -= 30.0f;
                     nutrient_ = std::max(0.0f, nutrient_ - 1.5f);
@@ -3948,12 +3948,14 @@ private:
 
             if (d.stage == 2 && d.health > 0.40f && d.energy >= 60.0f
                 && d.breedCooldown <= 0.0f && oxygen_ > 54.0f
-                && plantCount_ >= 3
+                && plantCount_ >= 2
                 // Recruitment is food-limited.  Ten nymphs can strip a jar
                 // this size before they mature, so an adult only lays while
                 // there is a standing prey base to feed the brood: shrimp are
-                // the staple, tubifex a coarser fallback.
-                && shrimpCount_ + tubifexCount_ / 10 >= 7
+                // the staple, tubifex a coarser fallback.  The floor is four,
+                // not seven: at seven a pond that settled at five shrimp kept
+                // the lineage at zero for good.
+                && shrimpCount_ + tubifexCount_ / 10 >= 4
                 && damselCount_ < g_settings.maxDamsel && eggCount_ < kMaxEggs
                 && localStressAt(d.x, d.y, 2, d.g) < 0.65f) {
                 if (layEgg(2, childGenes(d.g), d.x)) {
@@ -4596,7 +4598,16 @@ private:
         // few minutes all sixteen bins sat at 100, the bed ran anoxic for the
         // rest of the run, and the toxin it produced killed the worms that
         // were supposed to keep the humus down.
-        const float target = std::clamp(20.0f + humus_ * 0.45f, 20.0f, 72.0f);
+        // Silt is built by the rooted stand as much as by the drifting
+        // detritus.  Tracking humus alone made the bed a mirror of animal
+        // waste: once the population thinned, the bed relaxed to 20 + 0.45 *
+        // humus (~25), which is below every recruitment threshold on the bed
+        // (plants 30, tubifex 26), so nothing could ever be recruited again
+        // and the pond settled into a permanent low.  Roots, leaf litter and
+        // the litter the stand sheds each cycle hold the bed up instead, so a
+        // surviving meadow can rebuild its own habitat.
+        const float target = std::clamp(20.0f + humus_ * 0.45f
+                                        + plantBiomass_ * 1.8f, 20.0f, 72.0f);
         const float relax = std::min(1.0f, dt * 0.060f);
         for (int i = 0; i < kSedimentBins; ++i) {
             sediment_[i] += (target - sediment_[i]) * relax;
@@ -5030,7 +5041,7 @@ private:
         // all three lineages could sit empty at the same time.  Oxygen and
         // plant cover are the conditions that actually matter to a recruit.
         if (fishEggs_ > 0 && fishCount_ < g_settings.maxFish && oxygen_ > 42.0f
-            && plantCount_ >= 3) {
+            && plantCount_ >= 2) {
             fishEggTimer_ += dt;
             if (fishEggTimer_ >= 28.0f) {
                 fishEggTimer_ = 0.0f;
@@ -5043,10 +5054,11 @@ private:
         }
 
         if (damselEggs_ > 0 && damselCount_ < g_settings.maxDamsel && oxygen_ > 44.0f
-            && plantCount_ >= 3
+            && plantCount_ >= 2
             // Same food gate as laying: during a prey trough the dormant
             // clutch simply waits, then resumes once the shrimp herd is back.
-            && shrimpCount_ + tubifexCount_ / 10 >= 6) {
+            // Three is the least a brood can hatch into and still feed itself.
+            && shrimpCount_ + tubifexCount_ / 10 >= 3) {
             damselEggTimer_ += dt;
             if (damselEggTimer_ >= 30.0f) {
                 damselEggTimer_ = 0.0f;
@@ -5114,7 +5126,7 @@ private:
             tubifexEggs_ = std::min(6, tubifexEggs_ + 1);
         }
         if (tubifexCount_ < 6 && tubifexEggs_ > 0
-            && sedimentAtX(160.0f) > 26.0f) {
+            && sedimentAtX(160.0f) > 22.0f) {
             tubifexEggTimer_ += dt;
             if (tubifexEggTimer_ >= 55.0f) {
                 tubifexEggTimer_ = 0.0f;
@@ -5128,7 +5140,10 @@ private:
         if (wormCount_ > 0 && rnd(0.0f, 1.0f) < dt * 0.004f) {
             wormCysts_ = std::min(4, wormCysts_ + 1);
         }
-        if (wormCount_ == 0 && wormCysts_ > 0 && humus_ > 12.0f) {
+        // A resting cyst only needs wet mud, not a rich detritus pool.  The
+        // old gate demanded humus > 12, which is exactly where a thinned-out
+        // pond equilibrates, so the worms could never come back.
+        if (wormCount_ == 0 && wormCysts_ > 0 && humus_ > 8.0f) {
             wormCystTimer_ += dt;
             if (wormCystTimer_ >= 90.0f) {
                 wormCystTimer_ = 0.0f;

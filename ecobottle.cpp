@@ -3114,10 +3114,18 @@ private:
                 : ((seasonNow == 2) ? 1.15f : (seasonNow == 0) ? 0.92f : 1.0f);
 
             if (!p.dying) {
+                // Maintenance respiration used to be a flat 0.5/s whatever the
+                // light, which put the break-even point around light 25.  A jar
+                // on a dim or idle desktop sits at 15-30 most of the day, so
+                // the stand spent that time draining its reserves to zero and
+                // could never reach the energy a new offshoot costs.  Respiration
+                // now scales with the light actually available, which puts the
+                // compensation point near light 7 and leaves a real surplus at
+                // desktop brightness.
+                const float upkeep = 0.12f + 0.25f * lightFactor;
                 p.energy = std::clamp(p.energy + dt * (lightFactor * nutrientFactor
                                   * sedimentFactor * epiFactor * typeGrowth * typeSeason
-                                  * 5.0f * phenology
-                                  - 0.5f),
+                                  * 5.0f * phenology - upkeep),
                                   0.0f, 100.0f);
                 p.growth = std::clamp(p.growth + dt * (0.006f + 0.020f * lightFactor
                                   * nutrientFactor * sedimentFactor * epiFactor
@@ -3136,19 +3144,37 @@ private:
                 const float plantStress = localStressAt(p.x, 72.0f, 5, Genes{});
                 p.health -= dt * plantStress * 0.0025f;
 
+                // Recovery used to switch off the moment the stand filled the
+                // jar (crowd > 0.95).  That is exactly the state a healthy
+                // meadow spends most of its time in, so a full cohort lost
+                // health in lockstep, the whole stand reached senescence at
+                // once, and recruitment (health > 0.6 and energy > 80) never
+                // lined up with a living parent.  Crowding now trims recovery
+                // instead of forbidding it, so a dense stand still ages but
+                // keeps a reproductive window.
+                const float crowdStrain = std::max(0.0f, crowd - 0.80f);
                 if (nutrient_ < 22.0f || sedimentAtX(p.x) < 20.0f
-                    || light_ < 14.0f || crowd > 0.95f) {
+                    || light_ < 10.0f) {
                     p.health -= dt * (0.0008f + 0.0008f * crowd);
                 } else {
-                    p.health = std::min(1.0f, p.health + dt * 0.0032f);
+                    p.health = std::min(1.0f, p.health
+                                        + dt * 0.0032f * (1.0f - 1.6f * crowdStrain));
                 }
                 p.health = std::clamp(p.health - dt * (1.0f - p.g.shade) * 0.0004f
                                       - dt * 0.0008f * p.epiphyte,
                                       0.0f, 1.0f);
 
                 mutatePlantStage(p);
-                if (p.stage == 2 && p.energy > 80.0f && p.health > 0.60f
-                    && plantCount_ < g_settings.maxPlants && light_ > 22.0f
+                // A parent only needs enough surplus to bank one propagule.
+                // The old floor (energy 80 at light 22) meant a dim jar never
+                // recruited at all and the stand had to be rebuilt from the
+                // finite seed bank instead of from its own living stems.
+                // A dim screen (battery, idle desktop) is a shaded day, not a
+                // night: weeds keep a slow positive carbon balance down to
+                // about light 10, so recruitment should not be gated higher
+                // than the light the stand can actually live at.
+                if (p.stage == 2 && p.energy > 60.0f && p.health > 0.60f
+                    && plantCount_ < g_settings.maxPlants && light_ > 12.0f
                     && sedimentAtX(p.x) > 26.0f && plantStress < 0.65f) {
                     spawnPlant(p.type, p.x, p.g);
                     p.energy -= 30.0f;
@@ -3192,7 +3218,7 @@ private:
                 continue;
             }
             if (plantTypeSeeds_[t] <= 0 || plantCount_ >= g_settings.maxPlants
-                || light_ < 18.0f || oxygen_ < 30.0f) {
+                || light_ < 10.0f || oxygen_ < 30.0f) {
                 continue;
             }
             const int season = static_cast<int>(seasonPhase_ / kTwoPi * 4.0f) & 3;
